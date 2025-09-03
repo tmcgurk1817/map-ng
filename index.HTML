@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Story Map</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Leaflet CSS and JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js" crossorigin=""></script>
+    <!-- Marker Cluster Library -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css" />
+    <script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        #map { height: 75vh; width: 100%; border-radius: 12px; }
+        .popup-content { max-width: 250px; }
+        .popup-content img { max-width: 100%; height: auto; border-radius: 8px; margin-top: 10px; }
+        .leaflet-popup-content-wrapper { border-radius: 12px; }
+    </style>
+</head>
+<body class="bg-gray-100 p-8 flex flex-col items-center">
+    <div class="max-w-4xl w-full">
+        <h1 class="text-4xl font-bold text-center text-gray-800 mb-2">Interactive Story Map</h1>
+        <p class="text-center text-gray-600 mb-8">Explore the stories others have shared on the map.</p>
+        
+        <div class="flex items-center space-x-2 mb-4">
+            <input type="text" id="viewer-search" placeholder="Loading pins..." disabled class="flex-grow px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+            <button id="viewer-search-btn" disabled class="px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                Search
+            </button>
+            <button id="reset-btn" disabled class="px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500">
+                Reset
+            </button>
+        </div>
+
+        <div id="map" class="mb-8"></div>
+
+        <div id="message-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full flex items-center justify-center">
+            <div class="relative bg-white p-8 rounded-lg shadow-xl text-center">
+                <h3 id="modal-title" class="text-lg font-semibold mb-4 text-gray-900"></h3>
+                <p id="modal-content" class="text-sm text-gray-600 mb-6"></p>
+                <button id="modal-close-btn" class="w-full px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                    Close
+                </button>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, query } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Modal elements and function for user feedback
+        const modal = document.getElementById('message-modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalContent = document.getElementById('modal-content');
+        const modalCloseBtn = document.getElementById('modal-close-btn');
+
+        function showMessageModal(title, message) {
+            modalTitle.textContent = title;
+            modalContent.textContent = message;
+            modal.classList.remove('hidden');
+        }
+
+        modalCloseBtn.addEventListener('click', () => {
+            modal.classList.add('hidden');
+        });
+
+        // Initialize Firebase
+        let db;
+        let isDataLoaded = false;
+        try {
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            const auth = getAuth(app);
+            if (initialAuthToken) {
+                 signInWithCustomToken(auth, initialAuthToken).then(() => console.log("Signed in with custom token.")).catch(e => console.error("Custom token sign-in failed:", e));
+            } else {
+                 signInAnonymously(auth).then(() => console.log("Signed in anonymously.")).catch(e => console.error("Anonymous sign-in failed:", e));
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    console.log("Authenticated with userId:", user.uid);
+                    fetchPins();
+                } else {
+                    console.log("No user is signed in.");
+                }
+            });
+        } catch (e) {
+            console.error("Firebase initialization failed:", e);
+        }
+
+        const map = L.map('map').setView([0, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+        }).addTo(map);
+        
+        const markers = L.markerClusterGroup();
+        let allPins = [];
+        
+        async function fetchPins() {
+            if (!db) {
+                console.error("Database not initialized.");
+                return;
+            }
+
+            showMessageModal("Loading...", "Fetching stories from the database.");
+
+            const collectionPath = `/artifacts/${appId}/public/data/pins`;
+            const q = query(collection(db, collectionPath));
+
+            onSnapshot(q, (querySnapshot) => {
+                allPins = [];
+                querySnapshot.forEach((doc) => {
+                    allPins.push(doc.data());
+                });
+                console.log(`Fetched ${allPins.length} pins from the database.`);
+                displayPins(allPins);
+
+                isDataLoaded = true;
+                document.getElementById('viewer-search').placeholder = "Search by name or place...";
+                document.getElementById('viewer-search').disabled = false;
+                document.getElementById('viewer-search-btn').disabled = false;
+                document.getElementById('reset-btn').disabled = false;
+                modal.classList.add('hidden');
+
+            }, (error) => {
+                console.error("Error fetching documents:", error);
+                showMessageModal("Error", "Failed to load pins from the database. Please try again later.");
+            });
+        }
+
+        function displayPins(pinsToDisplay) {
+            markers.clearLayers();
+            if (pinsToDisplay.length === 0) {
+                 map.setView([0, 0], 2);
+            }
+            pinsToDisplay.forEach((data) => {
+                const { name, place, text, mediaUrl, latitude, longitude } = data;
+                
+                if (latitude && longitude) {
+                    let mediaContent = '';
+                    if (mediaUrl) {
+                        if (isImageUrl(mediaUrl)) {
+                            mediaContent = `<img src="${mediaUrl}" alt="User provided media" class="rounded-lg">`;
+                        } else if (mediaUrl.includes('youtube.com')) {
+                            mediaContent = `
+                                <div class="relative w-full overflow-hidden" style="padding-top: 56.25%;">
+                                    <iframe class="absolute top-0 left-0 w-full h-full" src="${mediaUrl.replace('watch?v=', 'embed/')}" frameborder="0" allowfullscreen></iframe>
+                                </div>
+                            `;
+                        } else {
+                            mediaContent = `<a href="${mediaUrl}" target="_blank" class="text-blue-500 hover:underline">View Media</a>`;
+                        }
+                    }
+
+                    let popupContent = `
+                        <div class="popup-content">
+                            <h3 class="font-bold text-base mb-1">${name}</h3>
+                            ${place ? `<p class="font-medium text-gray-600">${place}</p>` : ''}
+                            <p class="text-sm mt-2">${text}</p>
+                            ${mediaContent ? `<div class="mt-4">${mediaContent}</div>` : ''}
+                        </div>
+                    `;
+                    
+                    const marker = L.marker([latitude, longitude]);
+                    marker.bindPopup(popupContent, { minWidth: 250 });
+                    markers.addLayer(marker);
+                }
+            });
+            map.addLayer(markers);
+        }
+        
+        function isImageUrl(url) {
+            return (url.match(/\.(jpeg|jpg|gif|png|webp|svg)$/i) != null);
+        }
+
+        const searchInput = document.getElementById('viewer-search');
+        const searchBtn = document.getElementById('viewer-search-btn');
+        const resetBtn = document.getElementById('reset-btn');
+
+        searchBtn.addEventListener('click', () => {
+            if (!isDataLoaded) {
+                showMessageModal("Loading...", "Please wait while the pins are being loaded from the database.");
+                return;
+            }
+
+            const query = searchInput.value.toLowerCase();
+            if (query.trim() === '') {
+                displayPins(allPins);
+                return;
+            }
+
+            const filteredPins = allPins.filter(pin => {
+                const nameMatch = pin.name && pin.name.toLowerCase().includes(query);
+                const placeMatch = pin.place && pin.place.toLowerCase().includes(query);
+                return nameMatch || placeMatch;
+            });
+
+            displayPins(filteredPins);
+        });
+
+        resetBtn.addEventListener('click', () => {
+            searchInput.value = '';
+            displayPins(allPins);
+            map.setView([0, 0], 2);
+        });
+
+    </script>
+</body>
+</html>
+
+
